@@ -125,7 +125,7 @@ API_URL=https://your-api-gateway-url
 
 ## Configuration
 
-- **Max tokens**: 500 (configurable in Step Functions)
+- **Max tokens**: 400 (configurable in Step Functions)
 - **Audio expiry**: 15 minutes
 - **Supported models**: Claude 3 Haiku
 
