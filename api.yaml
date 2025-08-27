@@ -1,0 +1,69 @@
+openapi: "3.0.1"
+info:
+  title: "SAMStepFunctionsRestApi"
+  version: "1.0"
+paths:
+  /:
+    post:
+      responses:
+        "400":
+          description: "400 response"
+          content: {}
+        "200":
+          description: "200 response"
+          content: {}
+      x-amazon-apigateway-integration:
+        credentials:
+          Fn::GetAtt: [RestApiRole, Arn]
+        httpMethod: "POST"
+        uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:states:action/StartExecution
+        requestTemplates:
+          application/json:
+            Fn::Sub: |
+              {
+                "input": "$util.escapeJavaScript($input.json('$'))",
+                "name": "$context.requestId",
+                "stateMachineArn": "${SummarizationStateMachine}"
+              }
+        responses:
+          "200":
+            statusCode: "200"
+            responseTemplates:
+              application/json: |
+                {
+                  "executionArn": "$input.path('$.executionArn')",
+                  "startDate": "$input.path('$.startDate')",
+                  "status": "RUNNING"
+                }
+          "400":
+            statusCode: "400"
+            responseTemplates:
+              application/json: |
+                {
+                  "error": "Failed to start workflow",
+                  "details": "$input.json('$.message')"
+                }
+        passthroughBehavior: "when_no_match"
+        type: "aws"
+    options:
+      responses:
+        "200":
+          description: "CORS response"
+          headers:
+            Access-Control-Allow-Origin: {}
+            Access-Control-Allow-Methods: {}
+            Access-Control-Allow-Headers: {}
+          content: {}
+      x-amazon-apigateway-integration:
+        type: mock
+        requestTemplates:
+          application/json: '{"statusCode": 200}'
+        responses:
+          "200":
+            statusCode: "200"
+            responseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+components: {}

@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  text-summarization
+  Sample SAM Template for stepfunctions-text-sum
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Parameters:
+  # amazonq-ignore-next-line
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Resources:
+
+  #API Gateway
+  SummarizationAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "text-summarization-api-${AWS::StackName}"
+      StageName: !Ref Environment
+      DefinitionBody:
+        'Fn::Transform':
+          Name: 'AWS::Include'
+          Parameters:
+            Location: 'api.yaml'
+
+  #API Websocket
+  SummarizationAPIWebSocket:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "websocket-api-${AWS::StackName}"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.Action
+   
+  # register route for custom messages
+  WebSocketRegisterRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+      RouteKey: register
+      AuthorizationType: NONE
+      Target: !Sub integrations/${OnConnectLambdaIntegration}
+
+  #OnConnectLambdaIntegration
+  OnConnectLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectLambda.Arn}/invocations
+
+  # Second route for starting summarization
+  WebSocketDisconnetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${OnDisconnectLambdaIntegration}
+  
+  OnDisconnectLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectLambda.Arn}/invocations
+
+  # WebSocket Deployment
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+    DependsOn:
+      - WebSocketRegisterRoute
+      - WebSocketDisconnetRoute
+
+  # WebSocket Stage
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref SummarizationAPIWebSocket
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref Environment
+
+  #STATE MACHINE
+  SummarizationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionSubstitutions:
+        LambdaFunctionArn: !GetAtt TextSummarySendResult.Arn
+        Bucket_Name: !Ref AudioOutputBucket
+        AudioLink: !GetAtt AudioLink.Arn
+        TextSummaryTableName: !Ref TextSummaryTable
+      Role: !GetAtt SummarizationStateMachineRole.Arn
+      Type: STANDARD
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionUri: summarization.asl.json
+
+    # CLOUDWATCH log
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/stepfunctions/${AWS::StackName}-SummarizationStateMachine
+      RetentionInDays: 14
+
+  # IAM ROLE for API Gateway to start execution of Step Function
+  RestApiRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: AllowSFNExec
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action: "states:StartExecution"
+              Resource: !GetAtt SummarizationStateMachine.Arn
+
+  #  DYNAMO DB save summary from LLM
+  TextSummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: anthropic_claude-text-summary-results
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ExecutionArn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ExecutionArn
+          KeyType: HASH
+
+  # DYNAMO DB for WebSocket connections
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: websocket-connections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ExecutionArn
+          AttributeType: S
+        - AttributeName: WsClientId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ExecutionArn
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: WSConnectionIndex
+          KeySchema:
+            - AttributeName: WsClientId
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+
+  # S3 BUCKET for Polly audio output
+  AudioOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-audio-output-${AWS::AccountId}
+      # amazonq-ignore-next-line
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # LAMBDA FUNCTIONS
+  TextSummarySendResult:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: src/websocket-handler/
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          RESULTS_TABLE_NAME: !Ref TextSummaryTable
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+          API_REGION: !Ref AWS::Region
+          WEBSOCKET_CALLBACK_URL: !Sub "https://${SummarizationAPIWebSocket}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+      Policies:
+        - Statement: 
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SummarizationAPIWebSocket}/${Environment}/POST/@connections/*
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TextSummaryTable
+        # amazonq-ignore-next-line
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        
+  AudioLink:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: src/audio_link/
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          API_REGION: !Ref AWS::Region 
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref AudioOutputBucket
+      LoggingConfig:
+        LogGroup: !Ref AudioLinkLogGropu
+
+  #On connect lambda
+  OnConnectLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: src/on_connect/
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+      LoggingConfig:
+        LogGroup: !Ref OnConnectLambdaLogGroup
+  
+  OnDisconnectLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: src/on_disconnect/
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+      LoggingConfig:
+        LogGroup: !Ref OnDisconnectLambdaLogGroup
+  
+  #log groups for lamdas 
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-TextSummarySendResult
+      RetentionInDays: 14 
+  AudioLinkLogGropu:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-AudioLink
+      RetentionInDays: 14
+  OnConnectLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-OnConnectLambda
+      RetentionInDays: 14
+  OnDisconnectLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-OnDisconnectLambda
+      RetentionInDays: 14
+
+  # Permission for API Gateway to invoke OnConnect Lambda
+  OnConnectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OnConnectLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SummarizationAPIWebSocket}/*/*"
+  
+  # Permission for API Gateway to invoke OnDisconnect Lambda
+  TextSummarySendResultPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OnDisconnectLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SummarizationAPIWebSocket}/*/*"
+      
+    # IAM ROLE for STEP
+  SummarizationStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - arn:aws:bedrock:eu-west-2::foundation-model/anthropic.claude-3-haiku-20240307-v1:0
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt TextSummaryTable.Arn
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !GetAtt TextSummarySendResult.Arn
+                  - !GetAtt AudioLink.Arn
+        - PolicyName: PollyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:StartSpeechSynthesisTask
+                  - polly:GetSpeechSynthesisTask
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "arn:aws:s3:::${AudioOutputBucket}/*"
+
+Outputs:
+  RestApiEndpoint:
+    Description: "REST API Gateway endpoint URL to start Step Functions execution"
+    Value: !Sub "https://${SummarizationAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/"
+  SummarizationStateMachineArn:
+    Description: Summarization State Machine ARN
+    Value: !Ref SummarizationStateMachine
+  SummarizationStateMachineRole:
+    Description: IAM Role created for Hello World State Machine based on the
+      specified SAM Policy Templates
+    Value: !GetAtt SummarizationStateMachineRole.Arn
+  WebSocketURL:
+    Description: "WebSocket API URL"
+    Value: !Sub "wss://${SummarizationAPIWebSocket}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    
