@@ -101,14 +101,21 @@ API_URL=https://your-api-gateway-url
 ## Project Structure
 
 ```
-├── template.yaml           # SAM template
-├── src/
-│   ├── websocket-handler/   # WebSocket message sender
-│   ├── on_connect/         # WebSocket connection handler
-│   ├── on_disconnect/      # WebSocket disconnection handler
-│   └── audio_link/         # S3 presigned URL generator
-├── summarization.asl.json  # Step Functions definition
-└── workflow.ipynb         # Testing notebook
+├── LICENSE                 # MIT License
+├── README.md              # Project documentation
+├── api.yaml               # API Gateway specification
+├── template.yaml          # SAM CloudFormation template
+├── summarization.asl.json # Step Functions state machine definition
+├── workflow.ipynb         # Testing and demo notebook
+└── src/                   # Lambda function source code
+    ├── websocket-handler/ # WebSocket message sender
+    │   └── index.py
+    ├── on_connect/        # WebSocket connection handler
+    │   └── index.py
+    ├── on_disconnect/     # WebSocket disconnection handler
+    │   └── index.py
+    └── audio_link/        # S3 presigned URL generator
+        └── index.py
 ```
 
 ## API Endpoints
